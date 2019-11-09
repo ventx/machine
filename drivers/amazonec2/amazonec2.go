@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	mathrand "math/rand"
 	"net"
 	"net/url"
 	"strconv"
@@ -96,8 +97,8 @@ type Driver struct {
 	VolumeType              string
 	IamInstanceProfile      string
 	VpcId                   string
-	SubnetId                string
-	Zone                    string
+	SubnetIds               []string
+	Zones                   []string
 	keyPath                 string
 	RequestSpotInstance     bool
 	SpotPrice               string
@@ -152,15 +153,15 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Usage:  "AWS VPC id",
 			EnvVar: "AWS_VPC_ID",
 		},
-		mcnflag.StringFlag{
+		mcnflag.StringSliceFlag{
 			Name:   "amazonec2-zone",
-			Usage:  "AWS zone for instance (i.e. a,b,c,d,e)",
-			Value:  defaultZone,
+			Usage:  "AWS zone for instance (i.e. a,b,c,d,e). Can contain multiple zones. Instances will only be launched in healthy availablity zones. If no zone is configured, all available zones will be used.",
+			Value:  []string{defaultZone},
 			EnvVar: "AWS_ZONE",
 		},
-		mcnflag.StringFlag{
+		mcnflag.StringSliceFlag{
 			Name:   "amazonec2-subnet-id",
-			Usage:  "AWS VPC subnet id",
+			Usage:  "AWS VPC subnet id. Can contain multiple subnet ids. Instances will only be launched in subnets within a healthy availability zone.",
 			EnvVar: "AWS_SUBNET_ID",
 		},
 		mcnflag.BoolFlag{
@@ -296,7 +297,7 @@ func NewDriver(hostName, storePath string) *Driver {
 		Region:               defaultRegion,
 		InstanceType:         defaultInstanceType,
 		RootSize:             defaultRootSize,
-		Zone:                 defaultZone,
+		Zones:                []string{defaultZone},
 		SecurityGroupNames:   []string{defaultSecurityGroup},
 		SpotPrice:            defaultSpotPrice,
 		BlockDurationMinutes: defaultBlockDurationMinutes,
@@ -360,12 +361,11 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.BlockDurationMinutes = int64(flags.Int("amazonec2-block-duration-minutes"))
 	d.InstanceType = flags.String("amazonec2-instance-type")
 	d.VpcId = flags.String("amazonec2-vpc-id")
-	d.SubnetId = flags.String("amazonec2-subnet-id")
+	d.SubnetIds = flags.StringSlice("amazonec2-subnet-id")
 	d.SecurityGroupNames = flags.StringSlice("amazonec2-security-group")
 	d.SecurityGroupReadOnly = flags.Bool("amazonec2-security-group-readonly")
 	d.Tags = flags.String("amazonec2-tags")
-	zone := flags.String("amazonec2-zone")
-	d.Zone = zone[:]
+	d.Zones = flags.StringSlice("amazonec2-zone")
 	d.DeviceName = flags.String("amazonec2-device-name")
 	d.RootSize = int64(flags.Int("amazonec2-root-size"))
 	d.VolumeType = flags.String("amazonec2-volume-type")
@@ -406,15 +406,15 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		}
 	}
 
-	if d.SubnetId == "" && d.VpcId == "" {
+	if len(d.SubnetIds) == 0 && d.VpcId == "" {
 		return errorNoVPCIdFound
 	}
 
-	if d.SubnetId != "" && d.VpcId != "" {
+	if len(d.SubnetIds) != 0 && d.VpcId != "" {
 		subnetFilter := []*ec2.Filter{
 			{
 				Name:   aws.String("subnet-id"),
-				Values: []*string{&d.SubnetId},
+				Values: makePointerSlice(d.SubnetIds),
 			},
 		}
 
@@ -428,9 +428,10 @@ func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 		if subnets == nil || len(subnets.Subnets) == 0 {
 			return errorNoSubnetsFound
 		}
-
-		if *subnets.Subnets[0].VpcId != d.VpcId {
-			return fmt.Errorf("SubnetId: %s does not belong to VpcId: %s", d.SubnetId, d.VpcId)
+		for _, subnet := range subnets.Subnets {
+			if *subnet.VpcId != d.VpcId {
+				return fmt.Errorf("SubnetId: %s does not belong to VpcId: %s", *subnet.SubnetId, d.VpcId)
+			}
 		}
 	}
 
@@ -490,12 +491,13 @@ func (d *Driver) checkPrereqs() error {
 		// otherwise we found the key: success
 	}
 
-	regionZone := d.getRegionZone()
-	if d.SubnetId == "" {
+	// When no dedicated subnets are configured, search for them (will return all subnets within the configured availability zones)
+	if len(d.SubnetIds) == 0 {
+		zones := d.getRegionZones()
 		filters := []*ec2.Filter{
 			{
 				Name:   aws.String("availability-zone"),
-				Values: []*string{&regionZone},
+				Values: makePointerSlice(zones),
 			},
 			{
 				Name:   aws.String("vpc-id"),
@@ -511,22 +513,13 @@ func (d *Driver) checkPrereqs() error {
 		}
 
 		if len(subnets.Subnets) == 0 {
-			return fmt.Errorf("unable to find a subnet that is both in the zone %s and belonging to VPC ID %s", regionZone, d.VpcId)
+			return fmt.Errorf("unable to find a subnet that is both in the zones %s and belonging to VPC ID %s", zones, d.VpcId)
 		}
 
-		d.SubnetId = *subnets.Subnets[0].SubnetId
-
-		// try to find default
-		if len(subnets.Subnets) > 1 {
-			for _, subnet := range subnets.Subnets {
-				if subnet.DefaultForAz != nil && *subnet.DefaultForAz {
-					d.SubnetId = *subnet.SubnetId
-					break
-				}
-			}
+		for _, subnet := range subnets.Subnets {
+			d.SubnetIds = append(d.SubnetIds, *subnet.SubnetId)
 		}
 	}
-
 	return nil
 }
 
@@ -625,15 +618,42 @@ func (d *Driver) innerCreate() error {
 			DeleteOnTermination: aws.Bool(true),
 		},
 	}
+
+	// Select a subnet located a healthy availability zone
+	healthyZones, err := d.getZoneTargets()
+	if err != nil {
+		return fmt.Errorf("unable to get healthy zones: %s", err)
+	}
+	if len(healthyZones) == 0 {
+		return fmt.Errorf("no healthy availability zone found")
+	}
+	targetSubnets, err := d.getClient().DescribeSubnets(&ec2.DescribeSubnetsInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("availability-zone"),
+				Values: makePointerSlice(healthyZones),
+			},
+		},
+		SubnetIds: makePointerSlice(d.SubnetIds),
+	})
+	if err != nil {
+		return fmt.Errorf("error describing subnets %s", err)
+	}
+	if len(targetSubnets.Subnets) == 0 {
+		return fmt.Errorf("no subnet in healthy availability zones found")
+	}
+	mathrand.Seed(time.Now().UTC().UnixNano())
+	targetSubnet := targetSubnets.Subnets[mathrand.Intn(len(targetSubnets.Subnets))]
+
 	netSpecs := []*ec2.InstanceNetworkInterfaceSpecification{{
 		DeviceIndex:              aws.Int64(0), // eth0
 		Groups:                   makePointerSlice(d.securityGroupIds()),
-		SubnetId:                 &d.SubnetId,
+		SubnetId:                 aws.String(*targetSubnet.SubnetId),
 		AssociatePublicIpAddress: aws.Bool(!d.PrivateIPOnly),
 	}}
 
-	regionZone := d.getRegionZone()
-	log.Debugf("launching instance in subnet %s", d.SubnetId)
+	regionZone := *targetSubnet.AvailabilityZone
+	log.Infof("launching instance in subnet %s", *targetSubnet.SubnetId)
 
 	var instance *ec2.Instance
 
@@ -765,7 +785,7 @@ func (d *Driver) innerCreate() error {
 	)
 
 	log.Debug("Settings tags for instance")
-	err := d.configureTags(d.Tags)
+	err = d.configureTags(d.Tags)
 
 	if err != nil {
 		return fmt.Errorf("Unable to tag instance %s: %s", d.InstanceId, err)
@@ -1262,11 +1282,61 @@ func (d *Driver) getDefaultVPCId() (string, error) {
 	return "", errors.New("No default-vpc attribute")
 }
 
-func (d *Driver) getRegionZone() string {
-	if d.Endpoint == "" {
-		return d.Region + d.Zone
+// Return a list of all healthy availability zones (marked as "available" in the AWS API). If no zone is healthy, all
+// zones are returned (we just try to launch instances to unhealthy zones, maybe we are lucky). If a list of zones
+// has been configured, we limit the search for those zones
+func (d *Driver) getZoneTargets() ([]string, error) {
+	configuredZones := d.getRegionZones()
+	var availabilityZones *ec2.DescribeAvailabilityZonesOutput
+	var err error
+	if len(configuredZones) == 0 {
+		availabilityZones, err = d.getClient().DescribeAvailabilityZones(&ec2.DescribeAvailabilityZonesInput{})
+	} else {
+		availabilityZones, err = d.getClient().DescribeAvailabilityZones(&ec2.DescribeAvailabilityZonesInput{
+			Filters: []*ec2.Filter{
+				{
+					Name:   aws.String("zone-name"),
+					Values: makePointerSlice(configuredZones),
+				},
+			},
+		})
 	}
-	return d.Zone
+	if err != nil {
+		return []string{}, err
+	}
+	var zones []string
+	if len(availabilityZones.AvailabilityZones) == 0 {
+		log.Debug("No availability zone found")
+		return []string{}, nil
+	}
+	for _, availableZone := range availabilityZones.AvailabilityZones {
+		if *availableZone.State == "available" {
+			zones = append(zones, *availableZone.ZoneName)
+		}
+	}
+	if len(zones) != 0 {
+		log.Debugf("Fond %d healthy availability zones: %s", zones)
+		return zones, nil
+	}
+	log.Warn("No healthy availability zone found, ignoring zone health status")
+	// only if no zone is healthy, put together all availability zones ignoring their health
+	for _, availableZone := range availabilityZones.AvailabilityZones {
+		zones = append(zones, *availableZone.ZoneName)
+	}
+	return zones, nil
+}
+
+func (d *Driver) getRegionZones() []string {
+	var zones []string
+	// If no custom endpoint is set, assume, that we are running in AWS and create AWS zone names
+	if d.Endpoint == "" {
+		for _, zone := range d.Zones {
+			zones = append(zones, d.Region+zone)
+		}
+		return zones
+	}
+	// With a custom endpoint keep the zone names, as they are
+	return d.Zones
 }
 
 func generateId() string {

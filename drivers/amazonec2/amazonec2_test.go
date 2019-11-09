@@ -265,9 +265,9 @@ func TestGetRegionZoneForDefaultEndpoint(t *testing.T) {
 
 	err := driver.SetConfigFromFlags(options)
 
-	regionZone := driver.getRegionZone()
+	regionZone := driver.getRegionZones()
 
-	assert.Equal(t, "us-east-1e", regionZone)
+	assert.Equal(t, "us-east-1e", regionZone[0])
 	assert.NoError(t, err)
 }
 
@@ -285,9 +285,9 @@ func TestGetRegionZoneForCustomEndpoint(t *testing.T) {
 
 	err := driver.SetConfigFromFlags(options)
 
-	regionZone := driver.getRegionZone()
+	regionZone := driver.getRegionZones()
 
-	assert.Equal(t, "custom-zone", regionZone)
+	assert.Equal(t, "custom-zone", regionZone[0])
 	assert.NoError(t, err)
 }
 

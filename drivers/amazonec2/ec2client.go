@@ -7,6 +7,8 @@ type Ec2Client interface {
 
 	DescribeSubnets(input *ec2.DescribeSubnetsInput) (*ec2.DescribeSubnetsOutput, error)
 
+	DescribeAvailabilityZones(input *ec2.DescribeAvailabilityZonesInput) (*ec2.DescribeAvailabilityZonesOutput, error)
+
 	CreateTags(input *ec2.CreateTagsInput) (*ec2.CreateTagsOutput, error)
 
 	//SecurityGroup
