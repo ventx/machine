@@ -639,6 +639,17 @@ func (d *Driver) innerCreate() error {
 	if err != nil {
 		return fmt.Errorf("error describing subnets %s", err)
 	}
+	// Filter for subnets, that have space to launch another instance
+	n := 0
+	for _, subnet := range targetSubnets.Subnets {
+		if *subnet.AvailableIpAddressCount > 0 {
+			targetSubnets.Subnets[n] = subnet
+			n++
+		} else {
+			log.Warnf("Dropping subnet %s from available subnets. No more IPs available", *subnet.SubnetId)
+		}
+	}
+	targetSubnets.Subnets = targetSubnets.Subnets[:n]
 	if len(targetSubnets.Subnets) == 0 {
 		return fmt.Errorf("no subnet in healthy availability zones found")
 	}
